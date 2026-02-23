@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m5-claude-notify"
+version = "1.0.0"
+description = "M5StickC Claude Code Hook Plugin - Manage Claude hooks via Bluetooth SPP"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your@email.com"}
+]
+keywords = ["claude", "m5stick", "bluetooth", "hook", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/m5stick-claude-code-notification"
+Repository = "https://github.com/yourusername/m5stick-claude-code-notification.git"
+Issues = "https://github.com/yourusername/m5stick-claude-code-notification/issues"
+
+[tool.setuptools]
+packages = ["m5stick_claude_notify"]
+
+[tool.black]
+line-length = 120
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 120

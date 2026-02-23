@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "name": "m5-claude-notify",
+  "display_name": "M5StickC Claude Notification",
+  "version": "1.0.0",
+  "description": "M5StickC との Bluetooth SPP 通信を使用して、Claude Code のフックイベント（許可リクエスト、通知）を物理デバイスで管理するプラグイン",
+  "author": "sakamoto66",
+  "license": "MIT",
+  "homepage": "https://github.com/sakamoto66/m5-claude-code-notification",
+  "enabled_hooks": [
+    {
+      "hook_type": "PermissionRequest",
+      "description": "実行許可が必要な操作をM5StickCのボタンでALLOW/DENY",
+      "command": "python",
+      "args": [
+        "{plugin_path}/hook/client.py",
+        "--hook-type",
+        "permission"
+      ],
+      "timeout": 90
+    },
+    {
+      "hook_type": "Stop",
+      "description": "Claude 実行停止を M5StickC に通知",
+      "command": "python",
+      "args": [
+        "{plugin_path}/hook/client.py",
+        "--hook-type",
+        "notify"
+      ],
+      "timeout": 10
+    },
+    {
+      "hook_type": "Start",
+      "description": "Claude 実行開始を M5StickC に通知",
+      "command": "python",
+      "args": [
+        "{plugin_path}/hook/client.py",
+        "--hook-type",
+        "notify"
+      ],
+      "timeout": 10
+    },
+    {
+      "hook_type": "AskUserQuestion",
+      "description": "ユーザー質問を M5StickC に表示",
+      "command": "python",
+      "args": [
+        "{plugin_path}/hook/client.py",
+        "--hook-type",
+        "notify"
+      ],
+      "timeout": 10
+    },
+    {
+      "hook_type": "ExitPlanMode",
+      "description": "計画モード終了の承認を M5StickC に表示",
+      "command": "python",
+      "args": [
+        "{plugin_path}/hook/client.py",
+        "--hook-type",
+        "notify"
+      ],
+      "timeout": 10
+    }
+  ],
+  "setup": {
+    "required_hardware": ["M5StickC"],
+    "required_software": [
+      "Python 3.8+",
+      "pyserial"
+    ],
+    "manual_steps": [
+      "1. M5StickC にファームウェアを書き込む: cd m5stick && pio run --target upload",
+      "2. Windows の Bluetooth 設定で M5-Claude-Notify をペアリング",
+      "3. Python 依存パッケージをインストール: pip install -r hook/requirements.txt"
+    ]
+  }
+}
