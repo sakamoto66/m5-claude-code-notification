@@ -204,6 +204,121 @@ pip install -r hook/requirements.txt --upgrade
 
 Claude は自動的に `plugin.json` から最新の設定を読み込みます。
 
+## OS 別セットアップ
+
+### Windows / WSL2 での使用
+
+`~/.claude/settings.json` に以下を追加：
+
+```json
+{
+  "plugins": [
+    {
+      "name": "m5-claude-notify",
+      "path": "C:\\projects\\m5-claude-code-notification"
+    }
+  ]
+}
+```
+
+または、`settings.local.json` に記述：
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "C:\\projects\\m5-claude-code-notification\\hook\\client.py",
+              "--hook-type",
+              "permission"
+            ],
+            "timeout": 90
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**テスト：**
+
+```powershell
+python C:\projects\m5-claude-code-notification\hook\client.py --test
+```
+
+### Linux での使用
+
+1. **Bluetooth デバイスをペアリング：**
+
+```bash
+# デバイスの MAC アドレスを確認
+bluetoothctl list
+
+# ペアリング（初回のみ）
+bluetoothctl
+[bluetooth]# pair AA:BB:CC:DD:EE:FF
+[bluetooth]# connect AA:BB:CC:DD:EE:FF
+[bluetooth]# quit
+```
+
+2. **rfcomm でシリアルポートにバインド：**
+
+```bash
+sudo rfcomm bind /dev/rfcomm0 AA:BB:CC:DD:EE:FF
+```
+
+3. **settings.json に登録：**
+
+```json
+{
+  "plugins": [
+    {
+      "name": "m5-claude-notify",
+      "path": "/home/username/m5-claude-code-notification"
+    }
+  ]
+}
+```
+
+または：
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "/home/username/m5-claude-code-notification/hook/client.py",
+              "--hook-type",
+              "permission"
+            ],
+            "timeout": 90
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**テスト：**
+
+```bash
+python3 /home/username/m5-claude-code-notification/hook/client.py --test
+```
+
 ## アンインストール
 
 Claude からプラグインを削除する場合：
@@ -226,12 +341,57 @@ ls c:\projects\m5stick-claude-code-notification\plugin.json
 
 ### COM ポート自動検出に失敗
 
-```bash
+**Windows / WSL2：**
+
+```powershell
 # COM ポート一覧を表示
 python -m serial.tools.list_ports
 
 # 手動指定してテスト
 python hook/client.py --com-port COM5 --test permission
+```
+
+**Linux：**
+
+```bash
+# シリアルポート一覧を表示
+ls -la /dev/ttyUSB* /dev/ttyACM* /dev/rfcomm*
+python3 -m serial.tools.list_ports
+
+# rfcomm が正しくバインドされているか確認
+rfcomm list
+
+# 手動指定してテスト
+python3 hook/client.py --com-port /dev/rfcomm0 --test permission
+
+# または USB接続の場合
+python3 hook/client.py --com-port /dev/ttyUSB0 --test permission
+```
+
+### Bluetooth がペアリングされていない（Linux）
+
+```bash
+# デバイスのスキャン
+sudo bluetoothctl scan on
+
+# ペアリング
+sudo bluetoothctl pair AA:BB:CC:DD:EE:FF
+
+# 接続
+sudo bluetoothctl connect AA:BB:CC:DD:EE:FF
+
+# 確認
+bluetoothctl info AA:BB:CC:DD:EE:FF
+```
+
+### rfcomm のバインドに失敗する（Linux）
+
+```bash
+# 既存のバインドを削除
+sudo rfcomm release /dev/rfcomm0
+
+# 改めてバインド
+sudo rfcomm bind /dev/rfcomm0 AA:BB:CC:DD:EE:FF
 ```
 
 ### 権限エラーが出る

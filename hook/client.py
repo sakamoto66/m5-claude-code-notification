@@ -2,7 +2,7 @@
 """
 Claude Code M5StickC Hook クライアント (Bluetooth Classic SPP版)
 PermissionRequest / Stop / Start / PreToolUse の全フックを1ファイルで処理する。
-事前に Windows の設定で M5StickC をペアリングしてください。
+事前にペアリングしてください（Windows: 設定でペアリング / Linux: bluetoothctl でペアリング）。
 
 使い方:
   # Claude Code hook として使用（settings.json で指定）
@@ -16,18 +16,25 @@ PermissionRequest / Stop / Start / PreToolUse の全フックを1ファイルで
   python client.py --test stop              # Stop のみ
   python client.py --test question          # AskUserQuestion のみ
   python client.py --test plan              # ExitPlanMode のみ
-  python client.py --com-port COM5 --test   # COM ポートを手動指定してテスト
+  python client.py --com-port COM5 --test   # Windows: COM ポートを手動指定してテスト
+  python client.py --com-port /dev/ttyUSB0 --test # Linux: シリアルポートを手動指定してテスト
 """
 
 import argparse
 import json
+import platform
 import re
+import subprocess
 import sys
 import threading
 import time
-import winreg
 import serial
 import serial.tools.list_ports
+
+try:
+    import winreg
+except ImportError:
+    winreg = None  # Windows でのみ利用可能
 
 TARGET_NAME       = "M5-Claude-Notify"
 CONNECT_TIMEOUT   = 5.0   # seconds
@@ -74,12 +81,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
 # ---------------------------------------------------------------------------
 # Bluetooth ポート検出
 # ---------------------------------------------------------------------------
 
-def get_bt_device_name(mac_hex: str) -> str:
+def _get_bt_device_name_windows(mac_hex: str) -> str:
     """Windows レジストリから Bluetooth デバイス名を取得"""
+    if winreg is None:
+        return ""
+    
     reg_path = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as devices_key:
@@ -101,9 +112,9 @@ def get_bt_device_name(mac_hex: str) -> str:
     return ""
 
 
-def find_comport() -> str:
-    """ペアリング済み 'M5-Claude-Notify' の COM ポートを自動検出"""
-    sys.stderr.write("[client] Auto-detecting COM port for M5-Claude-Notify...\n")
+def _find_comport_windows() -> str:
+    """Windows: ペアリング済み 'M5-Claude-Notify' の COM ポートを自動検出"""
+    sys.stderr.write("[client] Auto-detecting COM port for M5-Claude-Notify (Windows)...\n")
 
     bt_ports = []
     for port_info in serial.tools.list_ports.comports():
@@ -129,7 +140,7 @@ def find_comport() -> str:
     for device, mac in bt_ports:
         if not mac:
             continue
-        name = get_bt_device_name(mac)
+        name = _get_bt_device_name_windows(mac)
         if not (name and TARGET_NAME.lower() in name.lower()):
             continue
         sys.stderr.write(f"[client] Found (MAC): {device} ({name!r})\n")
@@ -145,6 +156,58 @@ def find_comport() -> str:
         "  → Windows の設定でペアリングされているか確認してください。\n"
         "  → または --com-port COMx で手動指定してください。"
     )
+
+
+def _find_comport_linux() -> str:
+    """Linux: ペアリング済み M5StickC のシリアルポートを自動検出"""
+    sys.stderr.write("[client] Auto-detecting serial port for M5-Claude-Notify (Linux)...\n")
+
+    # 利用可能なシリアルポート一覧を取得
+    candidates = []
+    for port_info in serial.tools.list_ports.comports():
+        desc = port_info.description or ""
+        device = port_info.device or ""
+        sys.stderr.write(f"[client]   {device}: {desc!r}\n")
+        candidates.append((device, desc))
+
+    # Bluetooth RFCOMM ポートを優先的に確认
+    for device, desc in candidates:
+        if "rfcomm" in device.lower() or "bluetooth" in desc.lower():
+            sys.stderr.write(f"[client] Found (Bluetooth): {device}\n")
+            return device
+
+    # USB/FTDI デバイスも対応
+    for device, desc in candidates:
+        if any(name in device.lower() for name in ["/dev/ttyusb", "/dev/ttyacm"]):
+            sys.stderr.write(f"[client] Found (USB): {device}\n")
+            return device
+
+    # 説明にデバイス名が含まれているものを探す
+    for device, desc in candidates:
+        if TARGET_NAME.lower() in desc.lower() or "m5stick" in desc.lower():
+            sys.stderr.write(f"[client] Found (description): {device}\n")
+            return device
+
+    # fallback: /dev/ttyUSB0 を試す
+    if candidates:
+        device = candidates[0][0]
+        sys.stderr.write(f"[client] Found (first available): {device}\n")
+        return device
+
+    raise RuntimeError(
+        f"'{TARGET_NAME}' のシリアルポートが見つかりません。\n"
+        "  → Bluetooth デバイスが接続されているか確認してください。\n"
+        "  → rfcomm でペアリングされているか確認: rfcomm list\n"
+        "  → または --com-port /dev/ttyUSBx で手動指定してください。"
+    )
+
+
+def find_comport() -> str:
+    """プラットフォーム別にシリアルポートを自動検出"""
+    if sys.platform == "win32":
+        return _find_comport_windows()
+    else:
+        return _find_comport_linux()
 
 
 # ---------------------------------------------------------------------------
