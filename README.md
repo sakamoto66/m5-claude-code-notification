@@ -25,7 +25,7 @@ Claude Code に結果を返す
 ## ディレクトリ構成
 
 ```
-m5-claude-code-notification/
+claude-plugins/
 ├── plugin.json              # Claude プラグイン設定（新規）
 ├── README.md
 ├── plan.md

@@ -1,0 +1,7 @@
+{
+  "name": "m5stick-notify",
+  "description": "M5StickC との Bluetooth BLE 通信を使用して、Claude Code のフックイベント（許可リクエスト、通知）を物理デバイスで管理するプラグイン",
+  "author": {
+    "name": "sakamoto66"
+  }
+}

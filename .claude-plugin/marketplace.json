@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-plugins",
+  "description": "M5StickC BLE integration for Claude Code hooks - manage permission requests and notifications on a physical device",
+  "owner": {
+    "name": "sakamoto66"
+  },
+  "plugins": [
+    {
+      "name": "m5stick-notify",
+      "description": "M5StickC との Bluetooth BLE 通信を使用して、Claude Code のフックイベント（許可リクエスト、通知）を物理デバイスで管理するプラグイン",
+      "version": "1.0.0",
+      "author": {
+        "name": "sakamoto66"
+      },
+      "source": "./plugins/m5stick-notify",
+      "category": "development",
+      "homepage": "https://github.com/sakamoto66/claude-plugins"
+    }
+  ]
+}

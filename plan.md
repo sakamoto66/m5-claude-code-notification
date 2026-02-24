@@ -38,7 +38,7 @@ Claude Code CLI（許可 or 拒否）
 ## フォルダ構成
 
 ```
-m5-claude-code-notification/
+claude-plugins/
 ├── plan.md
 ├── m5stick/                    ← PlatformIO プロジェクト（M5StickC ファームウェア）
 │   ├── platformio.ini
