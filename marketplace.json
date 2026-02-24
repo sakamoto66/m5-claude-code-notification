@@ -1,0 +1,26 @@
+{
+  "name": "m5-claude-code-notification",
+  "owner": {
+    "name": "sakamoto66"
+  },
+  "metadata": {
+    "description": "M5StickC Claude Notification Plugin Marketplace",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "m5-claude-notify",
+      "source": ".",
+      "description": "M5StickC との Bluetooth SPP 通信を使用して、Claude Code のフックイベント（許可リクエスト、通知）を物理デバイスで管理するプラグイン",
+      "version": "1.0.0",
+      "author": {
+        "name": "sakamoto66"
+      },
+      "homepage": "https://github.com/sakamoto66/m5-claude-code-notification",
+      "repository": "https://github.com/sakamoto66/m5-claude-code-notification",
+      "license": "MIT",
+      "keywords": ["m5stick", "bluetooth", "notification", "hooks"],
+      "category": "hardware"
+    }
+  ]
+}
