@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-plugins",
+  "name": "sakamoto66-plugins",
   "description": "M5StickC BLE integration for Claude Code hooks - manage permission requests and notifications on a physical device",
   "owner": {
     "name": "sakamoto66"
