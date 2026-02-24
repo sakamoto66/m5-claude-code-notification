@@ -32,3 +32,6 @@ Thumbs.db
 .env.local
 *.local
 m5stick/.claude/settings.local.json
+
+# BLE address cache
+hook/.ble_cache.json

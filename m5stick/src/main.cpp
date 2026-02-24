@@ -1,12 +1,16 @@
 #include <M5StickC.h>
-#include <BluetoothSerial.h>
+#include <NimBLEDevice.h>
 
 #define DEVICE_NAME    "M5-Claude-Notify"
 #define SCREEN_WIDTH   160
 #define SCREEN_HEIGHT   80
 #define BTN_TIMEOUT    60000  // ms
 
-BluetoothSerial SerialBT;
+#define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+NimBLECharacteristic* pTxCharacteristic = nullptr;
 
 bool deviceConnected  = false;
 bool pendingResponse  = false;
@@ -27,9 +31,9 @@ void drawButtons();
 void drawNotify(const String& msg);
 void redrawCurrent();
 
-// Bluetooth SPP 接続状態コールバック
-void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
-    if (event == ESP_SPP_SRV_OPEN_EVT) {
+// BLE サーバーコールバック（接続・切断イベント）
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
         deviceConnected  = true;
         helloPending     = true;
         helloScheduledAt = millis();
@@ -37,7 +41,8 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
         resultMsg        = "";
         M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
         drawStatus("C", TFT_GREEN);
-    } else if (event == ESP_SPP_CLOSE_EVT) {
+    }
+    void onDisconnect(NimBLEServer* pServer) {
         deviceConnected = false;
         helloPending    = false;
         pendingResponse = false;
@@ -46,8 +51,36 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
             M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
         }
         drawStatus("W", TFT_YELLOW);
+        NimBLEDevice::startAdvertising();  // 切断後に再アドバタイズ
     }
-}
+};
+
+// RX Characteristic コールバック（PC → M5StickC のデータ受信）
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        String line = String(value.c_str());
+        line.trim();
+        if (line.length() > 0) {
+            notifyActive = false;
+            resultActive = false;
+            resultMsg    = "";
+
+            if (line.startsWith("NOTIFY:")) {
+                String notifyMsg = line.substring(7);
+                currentNotify = notifyMsg;
+                notifyActive  = true;
+                drawNotify(notifyMsg);
+            } else {
+                // 許可リクエスト
+                pendingResponse = true;
+                receivedCmd     = line;
+                cmdReceivedAt   = millis();
+                drawCommand(receivedCmd);
+            }
+        }
+    }
+};
 
 // 接続状態インジケーター（右上に小さく表示）C と W のみ
 void drawStatus(const char* msg, uint16_t color) {
@@ -169,11 +202,37 @@ void setup() {
     M5.Lcd.setTextSize(1);
 
     Serial.begin(115200);
-    SerialBT.register_callback(btCallback);
-    SerialBT.begin(DEVICE_NAME);
+
+    // BLE 初期化
+    NimBLEDevice::init(DEVICE_NAME);
+
+    // ボンディング設定（Windowsの標準ペアリングで使用可能）
+    NimBLEDevice::setSecurityAuth(true, true, true);           // bonding, MITM, SC
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT); // Just Works方式
+
+    NimBLEServer* pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
+
+    // TX Characteristic: M5StickC → PC (Notify)
+    pTxCharacteristic = pService->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+
+    // RX Characteristic: PC → M5StickC (Write, 暗号化必須)
+    NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+        NUS_RX_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
+    pRxCharacteristic->setCallbacks(new RxCallbacks());
+
+    pService->start();
+
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    pAdv->addServiceUUID(NUS_SERVICE_UUID);
+    pAdv->setScanResponse(true);
+    pAdv->start();
 
     drawStatus("W", TFT_YELLOW);
-    Serial.println("[M5] Bluetooth SPP started.");
+    Serial.println("[M5] BLE NUS started. Advertising...");
 }
 
 void loop() {
@@ -203,32 +262,9 @@ void loop() {
 
     // 接続から 500ms 後に hello を送信
     if (helloPending && (millis() - helloScheduledAt >= 500)) {
-        SerialBT.println("hello");
+        pTxCharacteristic->setValue("hello\n");
+        pTxCharacteristic->notify();
         helloPending = false;
-    }
-
-    // コマンド受信
-    if (SerialBT.available()) {
-        String line = SerialBT.readStringUntil('\n');
-        line.trim();
-        if (line.length() > 0) {
-            notifyActive = false;
-            resultActive = false;
-            resultMsg    = "";
-
-            if (line.startsWith("NOTIFY:")) {
-                String notifyMsg = line.substring(7);
-                currentNotify = notifyMsg;
-                notifyActive  = true;
-                drawNotify(notifyMsg);
-            } else {
-                // 許可リクエスト
-                pendingResponse = true;
-                receivedCmd     = line;
-                cmdReceivedAt   = millis();
-                drawCommand(receivedCmd);
-            }
-        }
     }
 
     // 通知 / 許可結果: ボタン A で黒画面に戻る
@@ -243,14 +279,16 @@ void loop() {
     if (pendingResponse) {
         if (M5.BtnA.wasPressed()) {
             resultMsg = "ALLOW";
-            SerialBT.println("ALLOW");
+            pTxCharacteristic->setValue("ALLOW\n");
+            pTxCharacteristic->notify();
             pendingResponse = false;
             resultActive    = true;
             redrawCurrent();
         }
         if (M5.BtnB.wasPressed()) {
             resultMsg = "DENY";
-            SerialBT.println("DENY");
+            pTxCharacteristic->setValue("DENY\n");
+            pTxCharacteristic->notify();
             pendingResponse = false;
             resultActive    = true;
             redrawCurrent();

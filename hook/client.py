@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Claude Code M5StickC Hook クライアント (Bluetooth Classic SPP版)
+Claude Code M5StickC Hook クライアント (BLE版)
 PermissionRequest / Stop / Start / PreToolUse の全フックを1ファイルで処理する。
-事前にペアリングしてください（Windows: 設定でペアリング / Linux: bluetoothctl でペアリング）。
+事前にWindowsの設定→Bluetoothでペアリングしてください（一度だけ）。
 
 使い方:
   # Claude Code hook として使用（settings.json で指定）
@@ -16,31 +16,29 @@ PermissionRequest / Stop / Start / PreToolUse の全フックを1ファイルで
   python client.py --test stop              # Stop のみ
   python client.py --test question          # AskUserQuestion のみ
   python client.py --test plan              # ExitPlanMode のみ
-  python client.py --com-port COM5 --test   # Windows: COM ポートを手動指定してテスト
-  python client.py --com-port /dev/ttyUSB0 --test # Linux: シリアルポートを手動指定してテスト
+  python client.py --ble-address AA:BB:CC:DD:EE:FF --test  # BLEアドレスを手動指定してテスト
 """
 
 import argparse
+import asyncio
 import json
-import platform
-import re
-import subprocess
 import sys
-import threading
-import time
-import serial
-import serial.tools.list_ports
+import traceback
+from pathlib import Path
 
-try:
-    import winreg
-except ImportError:
-    winreg = None  # Windows でのみ利用可能
+from bleak import BleakClient, BleakScanner
 
 TARGET_NAME       = "M5-Claude-Notify"
 CONNECT_TIMEOUT   = 5.0   # seconds
 HANDSHAKE_TIMEOUT = 10.0  # seconds
-BAUD_RATE         = 9600
 NOTIFY_SEND_WAIT  = 0.5   # 通知送信後に切断するまでの待機時間 (seconds)
+BTN_TIMEOUT       = 60.0  # ボタン押下待機タイムアウト (seconds)
+
+NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+NUS_RX_UUID      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+BLE_CACHE_FILE = Path(__file__).parent / ".ble_cache.json"
 
 # テスト用メッセージ定義
 TEST_EVENTS: dict = {
@@ -58,12 +56,12 @@ ALL_EVENTS    = list(TEST_EVENTS.keys()) + ["permission"]
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Claude Code M5Stick Hook Client")
+    parser = argparse.ArgumentParser(description="Claude Code M5Stick Hook Client (BLE)")
     parser.add_argument(
-        "--com-port",
+        "--ble-address",
         default="",
-        metavar="COMx",
-        help="COM port for M5-Claude-Notify (e.g. COM5). Auto-detected if omitted.",
+        metavar="XX:XX:XX:XX:XX:XX",
+        help="BLE address of M5-Claude-Notify. Auto-detected if omitted.",
     )
     parser.add_argument(
         "--hook-type",
@@ -81,218 +79,113 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-
 # ---------------------------------------------------------------------------
-# Bluetooth ポート検出
+# BLE アドレスキャッシュ（高速再接続用）
 # ---------------------------------------------------------------------------
 
-def _get_bt_device_name_windows(mac_hex: str) -> str:
-    """Windows レジストリから Bluetooth デバイス名を取得"""
-    if winreg is None:
-        return ""
-    
-    reg_path = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
+def _load_ble_cache() -> str:
+    """キャッシュされた BLE アドレスを返す。なければ空文字。"""
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as devices_key:
-            i = 0
-            while True:
-                try:
-                    subkey_name = winreg.EnumKey(devices_key, i)
-                    if subkey_name.lower() == mac_hex.lower():
-                        with winreg.OpenKey(devices_key, subkey_name) as dev_key:
-                            raw, _ = winreg.QueryValueEx(dev_key, "Name")
-                            if isinstance(raw, bytes):
-                                return raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
-                            return str(raw)
-                    i += 1
-                except OSError:
-                    break
-    except OSError:
+        with open(BLE_CACHE_FILE) as f:
+            return json.load(f).get("address", "")
+    except Exception:
+        return ""
+
+
+def _save_ble_cache(address: str) -> None:
+    """BLE アドレスをキャッシュファイルに保存する。"""
+    try:
+        with open(BLE_CACHE_FILE, "w") as f:
+            json.dump({"address": address.upper()}, f)
+    except Exception:
         pass
-    return ""
-
-
-def _find_comport_windows() -> str:
-    """Windows: ペアリング済み 'M5-Claude-Notify' の COM ポートを自動検出"""
-    sys.stderr.write("[client] Auto-detecting COM port for M5-Claude-Notify (Windows)...\n")
-
-    bt_ports = []
-    for port_info in serial.tools.list_ports.comports():
-        hwid = port_info.hwid or ""
-        desc = port_info.description or ""
-        sys.stderr.write(f"[client]   {port_info.device}: {desc!r} hwid={hwid}\n")
-
-        if "BTHENUM" not in hwid:
-            continue
-
-        mac = ""
-        m = re.search(r"BLUETOOTHDEVICE_([0-9A-Fa-f]{12})", hwid)
-        if m:
-            mac = m.group(1)
-        else:
-            m = re.search(r"&0&([0-9A-Fa-f]{12})[_&]", hwid)
-            if m and m.group(1) != "000000000000":
-                mac = m.group(1)
-
-        sys.stderr.write(f"[client]     mac={mac or '(none)'}\n")
-        bt_ports.append((port_info.device, mac))
-
-    for device, mac in bt_ports:
-        if not mac:
-            continue
-        name = _get_bt_device_name_windows(mac)
-        if not (name and TARGET_NAME.lower() in name.lower()):
-            continue
-        sys.stderr.write(f"[client] Found (MAC): {device} ({name!r})\n")
-        return device
-
-    for port_info in serial.tools.list_ports.comports():
-        if TARGET_NAME.lower() in (port_info.description or "").lower():
-            sys.stderr.write(f"[client] Found (description): {port_info.device}\n")
-            return port_info.device
-
-    raise RuntimeError(
-        f"'{TARGET_NAME}' の COM ポートが見つかりません。\n"
-        "  → Windows の設定でペアリングされているか確認してください。\n"
-        "  → または --com-port COMx で手動指定してください。"
-    )
-
-
-def _find_comport_linux() -> str:
-    """Linux: ペアリング済み M5StickC のシリアルポートを自動検出"""
-    sys.stderr.write("[client] Auto-detecting serial port for M5-Claude-Notify (Linux)...\n")
-
-    # 利用可能なシリアルポート一覧を取得
-    candidates = []
-    for port_info in serial.tools.list_ports.comports():
-        desc = port_info.description or ""
-        device = port_info.device or ""
-        sys.stderr.write(f"[client]   {device}: {desc!r}\n")
-        candidates.append((device, desc))
-
-    # Bluetooth RFCOMM ポートを優先的に確认
-    for device, desc in candidates:
-        if "rfcomm" in device.lower() or "bluetooth" in desc.lower():
-            sys.stderr.write(f"[client] Found (Bluetooth): {device}\n")
-            return device
-
-    # USB/FTDI デバイスも対応
-    for device, desc in candidates:
-        if any(name in device.lower() for name in ["/dev/ttyusb", "/dev/ttyacm"]):
-            sys.stderr.write(f"[client] Found (USB): {device}\n")
-            return device
-
-    # 説明にデバイス名が含まれているものを探す
-    for device, desc in candidates:
-        if TARGET_NAME.lower() in desc.lower() or "m5stick" in desc.lower():
-            sys.stderr.write(f"[client] Found (description): {device}\n")
-            return device
-
-    # fallback: /dev/ttyUSB0 を試す
-    if candidates:
-        device = candidates[0][0]
-        sys.stderr.write(f"[client] Found (first available): {device}\n")
-        return device
-
-    raise RuntimeError(
-        f"'{TARGET_NAME}' のシリアルポートが見つかりません。\n"
-        "  → Bluetooth デバイスが接続されているか確認してください。\n"
-        "  → rfcomm でペアリングされているか確認: rfcomm list\n"
-        "  → または --com-port /dev/ttyUSBx で手動指定してください。"
-    )
-
-
-def find_comport() -> str:
-    """プラットフォーム別にシリアルポートを自動検出"""
-    if sys.platform == "win32":
-        return _find_comport_windows()
-    else:
-        return _find_comport_linux()
 
 
 # ---------------------------------------------------------------------------
-# Bluetooth 共通: 接続 + ハンドシェイク
+# BLE デバイス検索
 # ---------------------------------------------------------------------------
 
-def _open_serial(port_name: str) -> serial.Serial:
-    """タイムアウト付きで Serial を開く"""
-    result: list = [None, None]
-
-    def do_open() -> None:
+async def find_ble_device() -> str:
+    """M5-Claude-Notify の BLE アドレスを返す（キャッシュ優先）。"""
+    # 高速パス: キャッシュ済みアドレスを試す
+    cached = _load_ble_cache()
+    if cached:
+        sys.stderr.write(f"[client] Trying cached address: {cached}\n")
         try:
-            result[0] = serial.Serial(port_name, BAUD_RATE, timeout=None)
-        except Exception as e:
-            result[1] = e
+            device = await asyncio.wait_for(
+                BleakScanner.find_device_by_address(cached),
+                timeout=2.0,
+            )
+            if device is not None:
+                sys.stderr.write(f"[client] Found (cache): {cached}\n")
+                return cached
+        except Exception:
+            pass
+        sys.stderr.write(f"[client] Cache miss, scanning...\n")
 
-    t = threading.Thread(target=do_open, daemon=True)
-    t.start()
-    deadline = time.monotonic() + CONNECT_TIMEOUT
-    while t.is_alive() and time.monotonic() < deadline:
-        t.join(timeout=0.5)
-    if t.is_alive():
-        raise RuntimeError(f"Connection timeout ({CONNECT_TIMEOUT}s)")
-    if result[1] is not None:
-        raise result[1]
-    return result[0]
+    # スキャンパス: デバイス名で検索
+    sys.stderr.write(f"[client] Scanning for '{TARGET_NAME}'...\n")
+    device = await asyncio.wait_for(
+        BleakScanner.find_device_by_name(TARGET_NAME),
+        timeout=CONNECT_TIMEOUT,
+    )
+    if device is None:
+        raise RuntimeError(
+            f"'{TARGET_NAME}' が見つかりません。\n"
+            "  → M5StickC の電源がオンでアドバタイズ中か確認してください。\n"
+            "  → または --ble-address XX:XX:XX:XX:XX:XX で手動指定してください。"
+        )
+    _save_ble_cache(device.address)
+    sys.stderr.write(f"[client] Found (scan): {device.address}\n")
+    return device.address
 
 
-def _handshake(ser: serial.Serial) -> None:
-    """M5Stick からの 'hello' を待つ"""
-    hello_result: list = [None, None]
+# ---------------------------------------------------------------------------
+# BLE 共通: ハンドシェイク
+# ---------------------------------------------------------------------------
 
-    def do_hello() -> None:
-        try:
-            hello_result[0] = ser.readline()
-        except Exception as e:
-            hello_result[1] = e
+async def _handshake_ble(client: BleakClient, queue: asyncio.Queue) -> None:
+    """TX Characteristic の通知を購読し、'hello' を待つ。"""
+    loop = asyncio.get_running_loop()
 
-    ht = threading.Thread(target=do_hello, daemon=True)
-    ht.start()
-    deadline = time.monotonic() + HANDSHAKE_TIMEOUT
-    while ht.is_alive() and time.monotonic() < deadline:
-        ht.join(timeout=0.5)
-    if ht.is_alive():
-        raise RuntimeError(f"Handshake timeout ({HANDSHAKE_TIMEOUT}s) - wrong port?")
-    greeting = (hello_result[0] or b"").decode("utf-8", errors="ignore").strip().lower()
-    if greeting != "hello":
+    def handler(sender, data: bytearray) -> None:
+        line = data.decode("utf-8", errors="ignore").replace('\x00', '').strip()
+        loop.call_soon_threadsafe(queue.put_nowait, line)
+
+    sys.stderr.write("[client] Subscribing to TX characteristic...\n")
+    await client.start_notify(NUS_TX_UUID, handler)
+    sys.stderr.write("[client] Waiting for hello...\n")
+
+    greeting = await asyncio.wait_for(queue.get(), timeout=HANDSHAKE_TIMEOUT)
+    if greeting.lower() != "hello":
         raise RuntimeError(f"Handshake failed: expected 'hello', got {greeting!r}")
     sys.stderr.write("[client] Handshake OK\n")
-    ser.reset_input_buffer()
 
 
 # ---------------------------------------------------------------------------
 # PermissionRequest: コマンド送信 → ALLOW/DENY 待機
 # ---------------------------------------------------------------------------
 
-def communicate_permission(port_name: str, display: str) -> str:
-    """許可リクエストを M5Stick に送信し、ボタン応答を待つ"""
-    sys.stderr.write(f"[client] Connecting to {port_name} (permission)...\n")
-    with _open_serial(port_name) as ser:
-        _handshake(ser)
+async def communicate_permission_ble(address: str, display: str) -> str:
+    """許可リクエストを M5Stick に送信し、ボタン応答を待つ。"""
+    sys.stderr.write(f"[client] Connecting to {address} (permission)...\n")
+    queue: asyncio.Queue = asyncio.Queue()
 
-        ser.write((display + "\n").encode("utf-8"))
-        ser.flush()
+    async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
+        sys.stderr.write("[client] Connected.\n")
+        try:
+            await client.request_mtu(512)
+        except AttributeError:
+            pass  # Windows WinRT backend handles MTU automatically
+        await _handshake_ble(client, queue)
+
+        payload = (display + "\n").encode("utf-8")
+        sys.stderr.write("[client] Writing to RX characteristic...\n")
+        await client.write_gatt_char(NUS_RX_UUID, payload, response=False)
         sys.stderr.write("[client] Sent command, waiting for button...\n")
 
-        read_result: list = [None, None]
-
-        def do_read() -> None:
-            try:
-                read_result[0] = ser.readline()
-            except Exception as e:
-                read_result[1] = e
-
-        rt = threading.Thread(target=do_read, daemon=True)
-        rt.start()
-        while rt.is_alive():
-            rt.join(timeout=0.5)
-        if read_result[1] is not None:
-            raise read_result[1]
-        line = read_result[0]
-        if not line:
-            raise RuntimeError("Button read failed (empty response)")
-
-        msg = line.decode("utf-8", errors="ignore").strip().upper()
+        response = await asyncio.wait_for(queue.get(), timeout=BTN_TIMEOUT)
+        msg = response.strip().upper()
         if msg not in ("ALLOW", "DENY"):
             raise RuntimeError(f"Unexpected response: {msg!r}")
 
@@ -319,18 +212,25 @@ def output_decision(decision: str) -> None:
 # Notify: メッセージ送信のみ（返答待ちなし）
 # ---------------------------------------------------------------------------
 
-def communicate_notify(port_name: str, message: str) -> None:
-    """通知を M5Stick に送信する（返答待ちなし）"""
-    sys.stderr.write(f"[client] Connecting to {port_name} (notify)...\n")
-    with _open_serial(port_name) as ser:
-        _handshake(ser)
+async def communicate_notify_ble(address: str, message: str) -> None:
+    """通知を M5Stick に送信する（返答待ちなし）。"""
+    sys.stderr.write(f"[client] Connecting to {address} (notify)...\n")
+    queue: asyncio.Queue = asyncio.Queue()
 
-        payload = f"NOTIFY:{message}\n"
-        ser.write(payload.encode("utf-8"))
-        ser.flush()
+    async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
+        sys.stderr.write("[client] Connected.\n")
+        try:
+            await client.request_mtu(512)
+        except AttributeError:
+            pass  # Windows WinRT backend handles MTU automatically
+        await _handshake_ble(client, queue)
+
+        payload = f"NOTIFY:{message}\n".encode("utf-8")
+        sys.stderr.write("[client] Writing to RX characteristic...\n")
+        await client.write_gatt_char(NUS_RX_UUID, payload, response=False)
         sys.stderr.write(f"[client] Sent notification: {message!r}\n")
 
-        time.sleep(NOTIFY_SEND_WAIT)
+        await asyncio.sleep(NOTIFY_SEND_WAIT)
 
     sys.stderr.write("[client] Done.\n")
 
@@ -339,9 +239,9 @@ def communicate_notify(port_name: str, message: str) -> None:
 # テスト
 # ---------------------------------------------------------------------------
 
-def run_tests(port_name: str, event: str) -> None:
-    """指定イベントのテストを実行する（event='all' は全イベントを順番に実施）"""
-    sys.stderr.write(f"[test] Using port: {port_name}\n")
+async def run_tests_ble(address: str, event: str) -> None:
+    """指定イベントのテストを実行する（event='all' は全イベントを順番に実施）。"""
+    sys.stderr.write(f"[test] Using BLE address: {address}\n")
 
     if event not in ALL_EVENTS + ["all"]:
         sys.stderr.write(
@@ -359,25 +259,27 @@ def run_tests(port_name: str, event: str) -> None:
     for name, message in notify_targets:
         sys.stderr.write(f"[test] --- {name} ---\n")
         try:
-            communicate_notify(port_name, message)
+            await communicate_notify_ble(address, message)
             sys.stderr.write(f"[test] '{name}' OK\n")
         except Exception as e:
-            sys.stderr.write(f"[test] '{name}' FAILED: {e}\n")
+            sys.stderr.write(f"[test] '{name}' FAILED: {type(e).__name__}: {e}\n")
+            traceback.print_exc(file=sys.stderr)
             sys.exit(1)
         if event == "all" and name != list(TEST_EVENTS)[-1]:
             sys.stderr.write("[test] 次のイベントまで 3 秒待機...\n")
-            time.sleep(3)
+            await asyncio.sleep(3)
 
     # permission テスト
     if event in ("all", "permission"):
         if event == "all":
             sys.stderr.write("\n[test] --- permission ---\n")
         try:
-            decision = communicate_permission(port_name, "TEST: Allow this test?")
+            decision = await communicate_permission_ble(address, "TEST: Allow this test?")
             sys.stderr.write(f"[test] Result: {decision}\n")
             sys.stderr.write("[test] 'permission' OK\n")
         except Exception as e:
-            sys.stderr.write(f"[test] 'permission' FAILED: {e}\n")
+            sys.stderr.write(f"[test] 'permission' FAILED: {type(e).__name__}: {e}\n")
+            traceback.print_exc(file=sys.stderr)
             sys.exit(1)
 
 
@@ -385,17 +287,15 @@ def run_tests(port_name: str, event: str) -> None:
 # エントリポイント
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
-
+async def _async_main(args: argparse.Namespace) -> None:
     # ---- テストモード ----
     if args.test is not None:
         try:
-            port_name = args.com_port if args.com_port else find_comport()
+            address = args.ble_address if args.ble_address else await find_ble_device()
         except Exception as e:
             sys.stderr.write(f"[test] {e}\n")
             sys.exit(1)
-        run_tests(port_name, args.test)
+        await run_tests_ble(address, args.test)
         return
 
     # ---- フックモード ----
@@ -421,8 +321,8 @@ def main() -> None:
         sys.stderr.write(f"[client] PermissionRequest: {tool_name}\n")
         display = f"{tool_name}: {json.dumps(tool_input)}"[:120]
         try:
-            port_name = args.com_port if args.com_port else find_comport()
-            decision  = communicate_permission(port_name, display)
+            address  = args.ble_address if args.ble_address else await find_ble_device()
+            decision = await communicate_permission_ble(address, display)
             output_decision("allow" if decision == "ALLOW" else "deny")
         except Exception as e:
             sys.stderr.write(f"[client] {e} → M5Stick unavailable, skipping hook\n")
@@ -447,10 +347,15 @@ def main() -> None:
 
         sys.stderr.write(f"[client] Notify: {display!r}\n")
         try:
-            port_name = args.com_port if args.com_port else find_comport()
-            communicate_notify(port_name, display)
+            address = args.ble_address if args.ble_address else await find_ble_device()
+            await communicate_notify_ble(address, display)
         except Exception as e:
             sys.stderr.write(f"[client] {e} → M5Stick unavailable, skipping notification\n")
+
+
+def main() -> None:
+    args = parse_args()
+    asyncio.run(_async_main(args))
 
 
 if __name__ == "__main__":

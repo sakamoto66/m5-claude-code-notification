@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "m5-claude-notify"
 version = "1.0.0"
-description = "M5StickC Claude Code Hook Plugin - Manage Claude hooks via Bluetooth SPP"
+description = "M5StickC Claude Code Hook Plugin - Manage Claude hooks via BLE"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pyserial>=3.5",
+    "bleak>=0.21.1",
 ]
 
 [project.urls]
