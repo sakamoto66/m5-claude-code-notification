@@ -101,14 +101,22 @@ def _save_ble_cache(address: str) -> None:
         pass
 
 
+def _clear_ble_cache() -> None:
+    """BLE キャッシュを削除する（再ペアリング後の不整合解消用）。"""
+    try:
+        BLE_CACHE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # BLE デバイス検索
 # ---------------------------------------------------------------------------
 
-async def find_ble_device() -> str:
+async def find_ble_device(use_cache: bool = True) -> str:
     """M5-Claude-Notify の BLE アドレスを返す（キャッシュ優先）。"""
     # 高速パス: キャッシュ済みアドレスを試す
-    cached = _load_ble_cache()
+    cached = _load_ble_cache() if use_cache else ""
     if cached:
         sys.stderr.write(f"[client] Trying cached address: {cached}\n")
         try:
@@ -291,7 +299,15 @@ async def _async_main(args: argparse.Namespace) -> None:
     # ---- テストモード ----
     if args.test is not None:
         try:
-            address = args.ble_address if args.ble_address else await find_ble_device()
+            if args.ble_address:
+                address = args.ble_address
+            else:
+                try:
+                    address = await find_ble_device(use_cache=True)
+                except Exception:
+                    sys.stderr.write("[test] Cache/scan failed, retrying with fresh scan...\n")
+                    _clear_ble_cache()
+                    address = await find_ble_device(use_cache=False)
         except Exception as e:
             sys.stderr.write(f"[test] {e}\n")
             sys.exit(1)
@@ -316,13 +332,31 @@ async def _async_main(args: argparse.Namespace) -> None:
     if hook_type == "auto":
         hook_type = "permission" if (tool_name and tool_name not in ("AskUserQuestion", "ExitPlanMode")) else "notify"
 
+    async def _get_address(use_cache: bool = True) -> str:
+        return args.ble_address if args.ble_address else await find_ble_device(use_cache)
+
+    async def _run_with_retry(operation, *op_args) -> object:
+        """BLE 操作を実行し、失敗時はキャッシュをクリアして一度だけ再試行する。"""
+        try:
+            address = await _get_address(use_cache=True)
+            return await operation(address, *op_args)
+        except Exception as first_err:
+            if args.ble_address:
+                raise  # 手動指定アドレスの場合は再試行しない
+            sys.stderr.write(
+                f"[client] Connection failed ({first_err}), "
+                "clearing cache and retrying with scan...\n"
+            )
+            _clear_ble_cache()
+            address = await _get_address(use_cache=False)
+            return await operation(address, *op_args)
+
     if hook_type == "permission":
         # PermissionRequest: コマンドを表示して ALLOW/DENY を待つ
         sys.stderr.write(f"[client] PermissionRequest: {tool_name}\n")
         display = f"{tool_name}: {json.dumps(tool_input)}"[:120]
         try:
-            address  = args.ble_address if args.ble_address else await find_ble_device()
-            decision = await communicate_permission_ble(address, display)
+            decision = await _run_with_retry(communicate_permission_ble, display)
             output_decision("allow" if decision == "ALLOW" else "deny")
         except Exception as e:
             sys.stderr.write(f"[client] {e} → M5Stick unavailable, skipping hook\n")
@@ -347,8 +381,7 @@ async def _async_main(args: argparse.Namespace) -> None:
 
         sys.stderr.write(f"[client] Notify: {display!r}\n")
         try:
-            address = args.ble_address if args.ble_address else await find_ble_device()
-            await communicate_notify_ble(address, display)
+            await _run_with_retry(communicate_notify_ble, display)
         except Exception as e:
             sys.stderr.write(f"[client] {e} → M5Stick unavailable, skipping notification\n")
 
