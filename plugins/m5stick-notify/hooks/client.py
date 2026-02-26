@@ -31,7 +31,6 @@ from bleak import BleakClient, BleakScanner
 TARGET_NAME       = "M5-Claude-Notify"
 CONNECT_TIMEOUT  = 5.0   # seconds
 NOTIFY_SEND_WAIT = 0.5   # 通知送信後に切断するまでの待機時間 (seconds)
-BTN_TIMEOUT       = 60.0  # ボタン押下待機タイムアウト (seconds)
 
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_RX_UUID      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -152,34 +151,39 @@ async def find_ble_device(use_cache: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 async def communicate_permission_ble(address: str, display: str) -> str:
-    """許可リクエストを M5Stick に送信し、ボタン応答を待つ。"""
-    sys.stderr.write(f"[client] Connecting to {address} (permission)...\n")
+    """許可リクエストを M5Stick に送信し、ボタン応答を待つ。
+    接続失敗・切断時は 3 秒後に再接続して同じコマンドを再送する（無限待機）。
+    """
+    payload = (display + "\n").encode("utf-8")
+    while True:
+        sys.stderr.write(f"[client] Connecting to {address} (permission)...\n")
+        try:
+            async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
+                sys.stderr.write("[client] Connected.\n")
+                await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
+                sys.stderr.write("[client] Command sent, polling for button...\n")
 
-    async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
-        sys.stderr.write("[client] Connected.\n")
-
-        payload = (display + "\n").encode("utf-8")
-        sys.stderr.write("[client] Writing to RX characteristic...\n")
-        await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
-        sys.stderr.write("[client] Command sent, polling for button...\n")
-
-        # READ ポーリング: 0.5s ごとに TX char を読む
-        # 0x00=未押下, 0x01=ALLOW, 0x02=DENY
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + BTN_TIMEOUT
-        while True:
-            if loop.time() >= deadline:
-                raise asyncio.TimeoutError()
-            data = await client.read_gatt_char(NUS_TX_UUID)
-            if data and data[0] != 0x00:
-                sys.stderr.write(f"[client] TX read: {data!r}\n")
-            if data and data[0] == 0x01:
-                sys.stderr.write("[client] M5Stick responded: ALLOW\n")
-                return "ALLOW"
-            if data and data[0] == 0x02:
-                sys.stderr.write("[client] M5Stick responded: DENY\n")
-                return "DENY"
-            await asyncio.sleep(0.5)
+                # READ ポーリング: 0.5s ごとに TX char を読む（タイムアウトなし）
+                # 0x00=未押下, 0x01=ALLOW, 0x02=DENY
+                while True:
+                    data = await client.read_gatt_char(NUS_TX_UUID)
+                    if data and data[0] != 0x00:
+                        sys.stderr.write(f"[client] TX read: {data!r}\n")
+                    if data and data[0] == 0x01:
+                        sys.stderr.write("[client] M5Stick responded: ALLOW\n")
+                        return "ALLOW"
+                    if data and data[0] == 0x02:
+                        sys.stderr.write("[client] M5Stick responded: DENY\n")
+                        return "DENY"
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            sys.stderr.write(f"[client] Connection error: {e} — retrying in 3s...\n")
+            await asyncio.sleep(3.0)
+            # デバイスを再スキャンしてアドレスを更新（M5Stick 再起動対応）
+            try:
+                address = await find_ble_device(use_cache=False)
+            except Exception:
+                pass  # スキャン失敗は無視して同じアドレスで再試行
 
 
 def output_decision(decision: str) -> None:
