@@ -16,14 +16,10 @@ bool deviceConnected = false;
 bool pendingResponse = false;
 bool notifyActive    = false;  // Start / Question / Done: ボタン A で消す
 bool resultActive    = false;  // ALLOW / DENY: ボタン A で消す
-bool pollRequested   = false;  // POLL コマンド受信フラグ（main loop で処理）
 
 String receivedCmd   = "";
 String currentNotify = "";
 String resultMsg     = "";
-// ボタン押下結果。String は notify() 後に NimBLE のヒープ操作で破壊されるため
-// フラッシュ上の文字列リテラルへのポインタで管理する。
-const char* buttonResult = "";  // "" = 未押下, "ALLOW\n" / "DENY\n" = 押下済み
 
 int8_t currentRotation = 3;
 
@@ -141,8 +137,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         deviceConnected = true;
         resultActive    = false;
         resultMsg       = "";
-        buttonResult    = "";   // 前セッションの結果をクリア
-        pollRequested   = false;
+        uint8_t z = 0;
+        pTxCharacteristic->setValue(&z, 1);  // ボタン結果をリセット
         M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
         drawStatus("C");
     }
@@ -150,7 +146,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         deviceConnected = false;
         pendingResponse = false;
         receivedCmd     = "";
-        pollRequested   = false;
         if (!notifyActive && !resultActive) {
             M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
         }
@@ -165,18 +160,12 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         line.trim();
         if (line.length() == 0) return;
 
-        // POLL: PC がボタン結果を問い合わせる。main loop で安全に処理する。
-        if (line == "POLL") {
-            pollRequested = true;
-            return;
-        }
-
         // 新コマンド受信: 前回の結果をクリアして表示を更新
         notifyActive  = false;
         resultActive  = false;
         resultMsg     = "";
-        buttonResult  = "";   // 前回の結果をクリア
-        pollRequested = false;
+        uint8_t z = 0;
+        pTxCharacteristic->setValue(&z, 1);  // ボタン結果をリセット
 
         if (line.startsWith("NOTIFY:")) {
             currentNotify = line.substring(7);
@@ -208,10 +197,15 @@ void setupBLE() {
 
     NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
 
-    // TX: M5StickC → PC (NOTIFY)
-    // Windows WinRT の "idle notify drop" は POLL プロトコルで回避済み
-    // （POLL write の直後に notify() を呼ぶため Windows は必ず配信する）。
-    pTxCharacteristic = pService->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+    // TX: M5StickC → PC (READ ポーリング方式)
+    // PC 側が 0.5s ごとに read_gatt_char で値を取得する。
+    // 0x00=未押下, 0x01=ALLOW, 0x02=DENY
+    // READ_ENC によりボンディング済みデバイスのみ読み取り可能。
+    pTxCharacteristic = pService->createCharacteristic(
+        NUS_TX_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC);
+    uint8_t z = 0;
+    pTxCharacteristic->setValue(&z, 1);
 
     // RX: PC → M5StickC（通常モードのみ）
     if (!pairingMode) {
@@ -284,18 +278,6 @@ void loop() {
         esp_restart();
     }
 
-    // POLL 応答: コールバック外の安全なコンテキストで notify を送る
-    if (pollRequested) {
-        pollRequested = false;
-        if (buttonResult[0] != '\0') {  // 非空チェック（ポインタは常に有効）
-            // setValue(const char*) は template<T> に解決されポインタアドレスを送る。
-            // (uint8_t*, size_t) を明示して文字列内容を送る。
-            pTxCharacteristic->setValue(
-                reinterpret_cast<const uint8_t*>(buttonResult), strlen(buttonResult));
-            pTxCharacteristic->notify();
-        }
-    }
-
     // 向き検知（横長維持: rotation 1 / 3）
     static unsigned long lastOrientCheck = 0;
     if (millis() - lastOrientCheck >= 500) {
@@ -323,11 +305,9 @@ void loop() {
         bool allow = M5.BtnA.wasPressed();
         bool deny  = M5.BtnB.wasPressed();
         if (allow || deny) {
-            resultMsg    = allow ? "ALLOW" : "DENY";
-            buttonResult = allow ? "ALLOW\n" : "DENY\n";  // フラッシュ上のリテラル
-            pTxCharacteristic->setValue(
-                reinterpret_cast<const uint8_t*>(buttonResult), strlen(buttonResult));
-            pTxCharacteristic->notify();
+            resultMsg       = allow ? "ALLOW" : "DENY";
+            uint8_t val     = allow ? 0x01 : 0x02;
+            pTxCharacteristic->setValue(&val, 1);  // PC が read_gatt_char で取得
             pendingResponse = false;
             resultActive    = true;
             redrawCurrent();

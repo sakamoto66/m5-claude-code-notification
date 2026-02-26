@@ -154,79 +154,32 @@ async def find_ble_device(use_cache: bool = True) -> str:
 async def communicate_permission_ble(address: str, display: str) -> str:
     """許可リクエストを M5Stick に送信し、ボタン応答を待つ。"""
     sys.stderr.write(f"[client] Connecting to {address} (permission)...\n")
-    queue: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
 
-    def handler(_sender, data: bytearray) -> None:
-        sys.stderr.write(f"[client] TX notification raw: {data!r}\n")
-        line = data.decode("utf-8", errors="ignore").replace('\x00', '').strip()
-        if line and line.isprintable():
-            loop.call_soon_threadsafe(queue.put_nowait, line)
-
-    def on_disconnect(_: BleakClient) -> None:
-        sys.stderr.write("[client] !!! BLE connection dropped !!!\n")
-
-    async with BleakClient(address, timeout=CONNECT_TIMEOUT, disconnected_callback=on_disconnect) as client:
+    async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
         sys.stderr.write("[client] Connected.\n")
-        try:
-            await client.request_mtu(512)
-        except AttributeError:
-            pass  # Windows WinRT backend handles MTU automatically
 
-        # Write command FIRST, then subscribe.
-        # On Windows WinRT, write_gatt_char (Write With Response) can corrupt the
-        # internal GATT session state so that ValueChanged notifications are never
-        # delivered afterwards.  Subscribing after the write avoids this race.
         payload = (display + "\n").encode("utf-8")
         sys.stderr.write("[client] Writing to RX characteristic...\n")
         await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
-        sys.stderr.write("[client] Command sent, subscribing for response...\n")
+        sys.stderr.write("[client] Command sent, polling for button...\n")
 
-        await client.start_notify(NUS_TX_UUID, handler)
-
-        # Wait for button press using POLL protocol.
-        # Every 0.5 s we write "POLL\n" to RX; the M5Stick main-loop replies with
-        # a notify() containing "ALLOW\n" or "DENY\n" only when a button was pressed.
-        # This is more reliable than waiting for an unsolicited notification because
-        # Windows WinRT tends to deliver notifications that immediately follow a
-        # GATT write, whereas idle notifications are often silently dropped.
-        sys.stderr.write("[client] CCCD set (NOTIFY), waiting for button (POLL mode)...\n")
+        # READ ポーリング: 0.5s ごとに TX char を読む
+        # 0x00=未押下, 0x01=ALLOW, 0x02=DENY
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + BTN_TIMEOUT
-        msg = None
-        while msg is None:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
+        while True:
+            if loop.time() >= deadline:
                 raise asyncio.TimeoutError()
-
+            data = await client.read_gatt_char(NUS_TX_UUID)
+            if data and data[0] != 0x00:
+                sys.stderr.write(f"[client] TX read: {data!r}\n")
+            if data and data[0] == 0x01:
+                sys.stderr.write("[client] M5Stick responded: ALLOW\n")
+                return "ALLOW"
+            if data and data[0] == 0x02:
+                sys.stderr.write("[client] M5Stick responded: DENY\n")
+                return "DENY"
             await asyncio.sleep(0.5)
-
-            # Send POLL request
-            try:
-                await client.write_gatt_char(NUS_RX_UUID, b"POLL\n", response=True)
-            except Exception as e:
-                sys.stderr.write(f"[client] Poll write error: {e}\n")
-                continue
-
-            # Give M5Stick ~150 ms to process and send the notify response
-            await asyncio.sleep(0.15)
-
-            # Drain the notification queue; accept first valid ALLOW/DENY
-            while True:
-                try:
-                    line = queue.get_nowait()
-                    val = line.strip().upper()
-                    if val in ("ALLOW", "DENY"):
-                        msg = val
-                        sys.stderr.write(f"[client] Got via poll-notify: {msg}\n")
-                        break
-                except asyncio.QueueEmpty:
-                    break
-
-        if msg not in ("ALLOW", "DENY"):
-            raise RuntimeError(f"Unexpected response: {msg!r}")
-
-        sys.stderr.write(f"[client] M5Stick responded: {msg}\n")
-        return msg
 
 
 def output_decision(decision: str) -> None:
