@@ -1,10 +1,9 @@
 #include <M5StickC.h>
 #include <NimBLEDevice.h>
 
-#define DEVICE_NAME    "M5-Claude-Notify"
-#define SCREEN_WIDTH   160
-#define SCREEN_HEIGHT   80
-#define BTN_TIMEOUT    60000  // ms
+#define DEVICE_NAME      "M5-Claude-Notify"
+#define SCREEN_WIDTH     160
+#define SCREEN_HEIGHT     80
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -12,85 +11,59 @@
 
 NimBLECharacteristic* pTxCharacteristic = nullptr;
 
-bool deviceConnected  = false;
-bool pendingResponse  = false;
-bool helloPending     = false;
-bool notifyActive     = false;  // Start / Question / Done: ボタン A で消す
-bool resultActive     = false;  // ALLOW / DENY: ボタン A で消す（次イベントでもリセット）
-String receivedCmd    = "";
-String currentNotify  = "";     // 通知内容（向き変更時の再描画用）
-String resultMsg      = "";     // "ALLOW" or "DENY"（再描画用）
-unsigned long cmdReceivedAt    = 0;
-unsigned long helloScheduledAt = 0;
+bool pairingMode     = false;  // BtnB 押し起動時のみ true（新規ペアリング許可）
+bool deviceConnected = false;
+bool pendingResponse = false;
+bool notifyActive    = false;  // Start / Question / Done: ボタン A で消す
+bool resultActive    = false;  // ALLOW / DENY: ボタン A で消す
+bool pollRequested   = false;  // POLL コマンド受信フラグ（main loop で処理）
+
+String receivedCmd   = "";
+String currentNotify = "";
+String resultMsg     = "";
+// ボタン押下結果。String は notify() 後に NimBLE のヒープ操作で破壊されるため
+// フラッシュ上の文字列リテラルへのポインタで管理する。
+const char* buttonResult = "";  // "" = 未押下, "ALLOW\n" / "DENY\n" = 押下済み
+
 int8_t currentRotation = 3;
 
-// 前方宣言
-void drawStatus(const char* msg, uint16_t color);
-void drawCommand(const String& cmd);
-void drawButtons();
-void drawNotify(const String& msg);
-void redrawCurrent();
+// --- 描画ヘルパー ---
 
-// BLE サーバーコールバック（接続・切断イベント）
-class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer) {
-        deviceConnected  = true;
-        helloPending     = true;
-        helloScheduledAt = millis();
-        resultActive     = false;
-        resultMsg        = "";
-        M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
-        drawStatus("C", TFT_GREEN);
+// テキストを折り返して描画
+static void drawWrappedText(int y, const String& text, uint16_t color, uint16_t bg) {
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(color, bg);
+    const int charsPerLine = 13;
+    int len = text.length();
+    for (int i = 0; i < len && y < SCREEN_HEIGHT - 13; i += charsPerLine) {
+        M5.Lcd.setCursor(2, y);
+        M5.Lcd.print(text.substring(i, min(i + charsPerLine, len)));
+        y += 18;
     }
-    void onDisconnect(NimBLEServer* pServer) {
-        deviceConnected = false;
-        helloPending    = false;
-        pendingResponse = false;
-        receivedCmd     = "";
-        if (!notifyActive && !resultActive) {
-            M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
-        }
-        drawStatus("W", TFT_YELLOW);
-        NimBLEDevice::startAdvertising();  // 切断後に再アドバタイズ
-    }
-};
+}
 
-// RX Characteristic コールバック（PC → M5StickC のデータ受信）
-class RxCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
-        String line = String(value.c_str());
-        line.trim();
-        if (line.length() > 0) {
-            notifyActive = false;
-            resultActive = false;
-            resultMsg    = "";
-
-            if (line.startsWith("NOTIFY:")) {
-                String notifyMsg = line.substring(7);
-                currentNotify = notifyMsg;
-                notifyActive  = true;
-                drawNotify(notifyMsg);
-            } else {
-                // 許可リクエスト
-                pendingResponse = true;
-                receivedCmd     = line;
-                cmdReceivedAt   = millis();
-                drawCommand(receivedCmd);
-            }
-        }
-    }
-};
-
-// 接続状態インジケーター（右上に小さく表示）C と W のみ
-void drawStatus(const char* msg, uint16_t color) {
-    int x = SCREEN_WIDTH - (strlen(msg) + 2) * 6 - 2;
+// 接続状態インジケーター: "C"→緑, "P"→シアン, "W"→黄
+void drawStatus(const char* msg) {
+    uint16_t color = (strcmp(msg, "C") == 0) ? TFT_GREEN :
+                     (strcmp(msg, "P") == 0) ? TFT_CYAN  :
+                                               TFT_YELLOW;
+    int x = SCREEN_WIDTH - (strlen(msg) + 2) * 12 - 2;
     M5.Lcd.setTextColor(color, TFT_BLACK);
-    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextSize(2);
     M5.Lcd.setCursor(x, 1);
-    M5.Lcd.print("[");
-    M5.Lcd.print(msg);
-    M5.Lcd.print("]");
+    M5.Lcd.printf("[%s]", msg);
+}
+
+// ボタンガイド（許可リクエスト画面下部）
+void drawButtons() {
+    M5.Lcd.fillRect(0, SCREEN_HEIGHT - 13, SCREEN_WIDTH, 13, TFT_PURPLE);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_GREEN, TFT_PURPLE);
+    M5.Lcd.setCursor(2, SCREEN_HEIGHT - 11);
+    M5.Lcd.print("[A]ALLOW");
+    M5.Lcd.setTextColor(TFT_RED, TFT_PURPLE);
+    M5.Lcd.setCursor(90, SCREEN_HEIGHT - 11);
+    M5.Lcd.print("[B]DENY");
 }
 
 // 許可リクエスト表示（紫背景）
@@ -107,73 +80,31 @@ void drawCommand(const String& cmd) {
     M5.Lcd.setCursor(2, 2);
     M5.Lcd.print(tool.substring(0, 13));
 
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(TFT_WHITE, TFT_PURPLE);
-    const int charsPerLine = 13;
-    int len = args.length();
-    int y = 22;
-    for (int i = 0; i < len && y < SCREEN_HEIGHT - 13; i += charsPerLine) {
-        M5.Lcd.setCursor(2, y);
-        M5.Lcd.print(args.substring(i, min(i + charsPerLine, len)));
-        y += 18;
-    }
-
+    drawWrappedText(22, args, TFT_WHITE, TFT_PURPLE);
     drawButtons();
 }
 
-// 通知表示
-// "Start"       → 紺背景・START ラベル・[A]OK（notifyActive）
-// "Q:..."       → 赤背景・QUESTION ラベル・[A]OK（notifyActive）
-// その他(Done)  → 緑背景・DONE ラベル・[A]OK（notifyActive）
+// 通知表示: "Start"→紺, "Q:..."→赤, その他→緑
 void drawNotify(const String& msg) {
     bool isStart    = (msg == "Start");
     bool isQuestion = msg.startsWith("Q:");
-    uint16_t bg     = isStart    ? TFT_NAVY   :
-                      isQuestion ? TFT_MAROON :
+    uint16_t bg     = isStart    ? TFT_NAVY      :
+                      isQuestion ? TFT_MAROON     :
                                    TFT_DARKGREEN;
 
     M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, bg);
     M5.Lcd.setTextSize(2);
     M5.Lcd.setTextColor(TFT_WHITE, bg);
     M5.Lcd.setCursor(2, 2);
+    M5.Lcd.print(isStart ? "START" : isQuestion ? "QUESTION" : "DONE");
 
-    if (isStart) {
-        M5.Lcd.print("START");
-    } else if (isQuestion) {
-        M5.Lcd.print("QUESTION");
-    } else {
-        M5.Lcd.print("DONE");
-    }
-
-    // 本文（Start は本文なし、Question は Q: を除いた部分）
     if (!isStart) {
         String body = isQuestion ? msg.substring(2) : msg;
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(TFT_CYAN, bg);
-        const int charsPerLine = 13;
-        int len = body.length();
-        int y = 22;
-        for (int i = 0; i < len && y < SCREEN_HEIGHT - 13; i += charsPerLine) {
-            M5.Lcd.setCursor(2, y);
-            M5.Lcd.print(body.substring(i, min(i + charsPerLine, len)));
-            y += 18;
-        }
+        drawWrappedText(22, body, TFT_CYAN, bg);
     }
 }
 
-// 許可リクエストのボタンガイド
-void drawButtons() {
-    M5.Lcd.fillRect(0, SCREEN_HEIGHT - 13, SCREEN_WIDTH, 13, TFT_PURPLE);
-    M5.Lcd.setTextColor(TFT_GREEN, TFT_PURPLE);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setCursor(2, SCREEN_HEIGHT - 11);
-    M5.Lcd.print("[A]ALLOW");
-    M5.Lcd.setTextColor(TFT_RED, TFT_PURPLE);
-    M5.Lcd.setCursor(90, SCREEN_HEIGHT - 11);
-    M5.Lcd.print("[B]DENY");
-}
-
-// 向き変更時に現在の画面を再描画
+// 現在の画面を再描画（向き変更時など）
 void redrawCurrent() {
     if (pendingResponse) {
         drawCommand(receivedCmd);
@@ -189,10 +120,143 @@ void redrawCurrent() {
         drawNotify(currentNotify);
     } else {
         M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
+        if (pairingMode) {
+            M5.Lcd.setTextSize(2);
+            M5.Lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+            M5.Lcd.setCursor(2, 20);
+            M5.Lcd.print("PAIRING");
+            M5.Lcd.setTextSize(1);
+            M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+            M5.Lcd.setCursor(2, 50);
+            M5.Lcd.print(DEVICE_NAME);
+        }
     }
-    drawStatus(deviceConnected ? "C" : "W",
-                deviceConnected ? TFT_GREEN : TFT_YELLOW);
+    drawStatus(deviceConnected ? "C" : pairingMode ? "P" : "W");
 }
+
+// --- BLE コールバック ---
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
+        deviceConnected = true;
+        resultActive    = false;
+        resultMsg       = "";
+        buttonResult    = "";   // 前セッションの結果をクリア
+        pollRequested   = false;
+        M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
+        drawStatus("C");
+    }
+    void onDisconnect(NimBLEServer* pServer) {
+        deviceConnected = false;
+        pendingResponse = false;
+        receivedCmd     = "";
+        pollRequested   = false;
+        if (!notifyActive && !resultActive) {
+            M5.Lcd.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, TFT_BLACK);
+        }
+        drawStatus(pairingMode ? "P" : "W");
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic) {
+        String line = String(pCharacteristic->getValue().c_str());
+        line.trim();
+        if (line.length() == 0) return;
+
+        // POLL: PC がボタン結果を問い合わせる。main loop で安全に処理する。
+        if (line == "POLL") {
+            pollRequested = true;
+            return;
+        }
+
+        // 新コマンド受信: 前回の結果をクリアして表示を更新
+        notifyActive  = false;
+        resultActive  = false;
+        resultMsg     = "";
+        buttonResult  = "";   // 前回の結果をクリア
+        pollRequested = false;
+
+        if (line.startsWith("NOTIFY:")) {
+            currentNotify = line.substring(7);
+            notifyActive  = true;
+            drawNotify(currentNotify);
+        } else {
+            receivedCmd     = line;
+            pendingResponse = true;
+            drawCommand(receivedCmd);
+        }
+    }
+};
+
+// --- BLE 初期化 ---
+
+void setupBLE() {
+    NimBLEDevice::init(DEVICE_NAME);
+
+    if (pairingMode) {
+        NimBLEDevice::deleteAllBonds();
+    }
+
+    // ボンディング設定（Just Works方式）
+    NimBLEDevice::setSecurityAuth(true, true, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+    NimBLEServer*  pServer  = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
+
+    // TX: M5StickC → PC (NOTIFY)
+    // Windows WinRT の "idle notify drop" は POLL プロトコルで回避済み
+    // （POLL write の直後に notify() を呼ぶため Windows は必ず配信する）。
+    pTxCharacteristic = pService->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+
+    // RX: PC → M5StickC（通常モードのみ）
+    if (!pairingMode) {
+        NimBLECharacteristic* pRx = pService->createCharacteristic(
+            NUS_RX_UUID,
+            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
+        pRx->setCallbacks(new RxCallbacks());
+    }
+
+    pService->start();
+
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+
+    if (pairingMode) {
+        // Microsoft Swift Pair: デバイス名を Primary に含めることで Windows 通知を表示
+        // Primary adv: 製造者データ(7B) + デバイス名(18B) + flags(3B) = 28B ≤ 31B
+        // Scan response: サービス UUID（128bit = 18B）
+        NimBLEAdvertisementData advData;
+        std::string msData;
+        msData += (char)0x06;  // Microsoft Company ID (0x0006)
+        msData += (char)0x00;
+        msData += (char)0x03;  // Swift Pair subtype
+        msData += (char)0x00;  // Reserved
+        msData += (char)0x80;  // Reserved RSSI
+        advData.setManufacturerData(msData);
+        advData.setName(DEVICE_NAME);
+        pAdv->setAdvertisementData(advData);
+
+        NimBLEAdvertisementData scanData;
+        scanData.setCompleteServices(NimBLEUUID(NUS_SERVICE_UUID));
+        pAdv->setScanResponseData(scanData);
+        pAdv->setScanResponse(true);
+    } else {
+        pAdv->addServiceUUID(NUS_SERVICE_UUID);
+
+        NimBLEAdvertisementData scanData;
+        scanData.setName(DEVICE_NAME);
+        pAdv->setScanResponseData(scanData);
+        pAdv->setScanResponse(true);
+    }
+
+    pAdv->start();
+}
+
+// --- setup / loop ---
 
 void setup() {
     M5.begin();
@@ -201,70 +265,49 @@ void setup() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextSize(1);
 
+    // BtnB 押し起動でペアリングモードに入る（他 PC への切り替え用）
+    delay(100);
+    M5.update();
+    pairingMode = M5.BtnB.isPressed();
+
     Serial.begin(115200);
 
-    // BLE 初期化
-    NimBLEDevice::init(DEVICE_NAME);
-
-    // ボンディング設定（Windowsの標準ペアリングで使用可能）
-    NimBLEDevice::setSecurityAuth(true, true, true);           // bonding, MITM, SC
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT); // Just Works方式
-
-    NimBLEServer* pServer = NimBLEDevice::createServer();
-    pServer->setCallbacks(new ServerCallbacks());
-
-    NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
-
-    // TX Characteristic: M5StickC → PC (Notify)
-    pTxCharacteristic = pService->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
-
-    // RX Characteristic: PC → M5StickC (Write, 暗号化必須)
-    NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
-        NUS_RX_UUID,
-        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
-    pRxCharacteristic->setCallbacks(new RxCallbacks());
-
-    pService->start();
-
-    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    pAdv->addServiceUUID(NUS_SERVICE_UUID);
-    pAdv->setScanResponse(true);
-    pAdv->start();
-
-    drawStatus("W", TFT_YELLOW);
-    Serial.println("[M5] BLE NUS started. Advertising...");
+    setupBLE();
+    redrawCurrent();
 }
 
 void loop() {
     M5.update();
 
-    // 向き検知（横長維持: rotation 1 / 3 の 2 パターン）
-    // accX > 0 → rotation 1、accX < 0 → rotation 3（逆の場合は符号を反転）
+    // ペアリングモード: ボンド生成を検知したら再起動して通常モードへ
+    if (pairingMode && NimBLEDevice::getNumBonds() > 0) {
+        esp_restart();
+    }
+
+    // POLL 応答: コールバック外の安全なコンテキストで notify を送る
+    if (pollRequested) {
+        pollRequested = false;
+        if (buttonResult[0] != '\0') {  // 非空チェック（ポインタは常に有効）
+            // setValue(const char*) は template<T> に解決されポインタアドレスを送る。
+            // (uint8_t*, size_t) を明示して文字列内容を送る。
+            pTxCharacteristic->setValue(
+                reinterpret_cast<const uint8_t*>(buttonResult), strlen(buttonResult));
+            pTxCharacteristic->notify();
+        }
+    }
+
+    // 向き検知（横長維持: rotation 1 / 3）
     static unsigned long lastOrientCheck = 0;
     if (millis() - lastOrientCheck >= 500) {
         lastOrientCheck = millis();
         float accX = 0, accY = 0, accZ = 0;
         M5.IMU.getAccelData(&accX, &accY, &accZ);
-        int8_t newRotation;
-        if (accX > 0.3f) {
-            newRotation = 1;
-        } else if (accX < -0.3f) {
-            newRotation = 3;
-        } else {
-            newRotation = currentRotation;
-        }
+        int8_t newRotation = (accX > 0.3f) ? 1 : (accX < -0.3f) ? 3 : currentRotation;
         if (newRotation != currentRotation) {
             currentRotation = newRotation;
             M5.Lcd.setRotation(currentRotation);
             redrawCurrent();
         }
-    }
-
-    // 接続から 500ms 後に hello を送信
-    if (helloPending && (millis() - helloScheduledAt >= 500)) {
-        pTxCharacteristic->setValue("hello\n");
-        pTxCharacteristic->notify();
-        helloPending = false;
     }
 
     // 通知 / 許可結果: ボタン A で黒画面に戻る
@@ -277,17 +320,13 @@ void loop() {
 
     // 許可リクエスト: ボタン操作
     if (pendingResponse) {
-        if (M5.BtnA.wasPressed()) {
-            resultMsg = "ALLOW";
-            pTxCharacteristic->setValue("ALLOW\n");
-            pTxCharacteristic->notify();
-            pendingResponse = false;
-            resultActive    = true;
-            redrawCurrent();
-        }
-        if (M5.BtnB.wasPressed()) {
-            resultMsg = "DENY";
-            pTxCharacteristic->setValue("DENY\n");
+        bool allow = M5.BtnA.wasPressed();
+        bool deny  = M5.BtnB.wasPressed();
+        if (allow || deny) {
+            resultMsg    = allow ? "ALLOW" : "DENY";
+            buttonResult = allow ? "ALLOW\n" : "DENY\n";  // フラッシュ上のリテラル
+            pTxCharacteristic->setValue(
+                reinterpret_cast<const uint8_t*>(buttonResult), strlen(buttonResult));
             pTxCharacteristic->notify();
             pendingResponse = false;
             resultActive    = true;

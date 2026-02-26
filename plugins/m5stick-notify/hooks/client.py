@@ -29,9 +29,8 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 
 TARGET_NAME       = "M5-Claude-Notify"
-CONNECT_TIMEOUT   = 5.0   # seconds
-HANDSHAKE_TIMEOUT = 10.0  # seconds
-NOTIFY_SEND_WAIT  = 0.5   # 通知送信後に切断するまでの待機時間 (seconds)
+CONNECT_TIMEOUT  = 5.0   # seconds
+NOTIFY_SEND_WAIT = 0.5   # 通知送信後に切断するまでの待機時間 (seconds)
 BTN_TIMEOUT       = 60.0  # ボタン押下待機タイムアウト (seconds)
 
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -149,28 +148,6 @@ async def find_ble_device(use_cache: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
-# BLE 共通: ハンドシェイク
-# ---------------------------------------------------------------------------
-
-async def _handshake_ble(client: BleakClient, queue: asyncio.Queue) -> None:
-    """TX Characteristic の通知を購読し、'hello' を待つ。"""
-    loop = asyncio.get_running_loop()
-
-    def handler(sender, data: bytearray) -> None:
-        line = data.decode("utf-8", errors="ignore").replace('\x00', '').strip()
-        loop.call_soon_threadsafe(queue.put_nowait, line)
-
-    sys.stderr.write("[client] Subscribing to TX characteristic...\n")
-    await client.start_notify(NUS_TX_UUID, handler)
-    sys.stderr.write("[client] Waiting for hello...\n")
-
-    greeting = await asyncio.wait_for(queue.get(), timeout=HANDSHAKE_TIMEOUT)
-    if greeting.lower() != "hello":
-        raise RuntimeError(f"Handshake failed: expected 'hello', got {greeting!r}")
-    sys.stderr.write("[client] Handshake OK\n")
-
-
-# ---------------------------------------------------------------------------
 # PermissionRequest: コマンド送信 → ALLOW/DENY 待機
 # ---------------------------------------------------------------------------
 
@@ -178,22 +155,73 @@ async def communicate_permission_ble(address: str, display: str) -> str:
     """許可リクエストを M5Stick に送信し、ボタン応答を待つ。"""
     sys.stderr.write(f"[client] Connecting to {address} (permission)...\n")
     queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-    async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
+    def handler(_sender, data: bytearray) -> None:
+        sys.stderr.write(f"[client] TX notification raw: {data!r}\n")
+        line = data.decode("utf-8", errors="ignore").replace('\x00', '').strip()
+        if line and line.isprintable():
+            loop.call_soon_threadsafe(queue.put_nowait, line)
+
+    def on_disconnect(_: BleakClient) -> None:
+        sys.stderr.write("[client] !!! BLE connection dropped !!!\n")
+
+    async with BleakClient(address, timeout=CONNECT_TIMEOUT, disconnected_callback=on_disconnect) as client:
         sys.stderr.write("[client] Connected.\n")
         try:
             await client.request_mtu(512)
         except AttributeError:
             pass  # Windows WinRT backend handles MTU automatically
-        await _handshake_ble(client, queue)
 
+        # Write command FIRST, then subscribe.
+        # On Windows WinRT, write_gatt_char (Write With Response) can corrupt the
+        # internal GATT session state so that ValueChanged notifications are never
+        # delivered afterwards.  Subscribing after the write avoids this race.
         payload = (display + "\n").encode("utf-8")
         sys.stderr.write("[client] Writing to RX characteristic...\n")
-        await client.write_gatt_char(NUS_RX_UUID, payload, response=False)
-        sys.stderr.write("[client] Sent command, waiting for button...\n")
+        await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
+        sys.stderr.write("[client] Command sent, subscribing for response...\n")
 
-        response = await asyncio.wait_for(queue.get(), timeout=BTN_TIMEOUT)
-        msg = response.strip().upper()
+        await client.start_notify(NUS_TX_UUID, handler)
+
+        # Wait for button press using POLL protocol.
+        # Every 0.5 s we write "POLL\n" to RX; the M5Stick main-loop replies with
+        # a notify() containing "ALLOW\n" or "DENY\n" only when a button was pressed.
+        # This is more reliable than waiting for an unsolicited notification because
+        # Windows WinRT tends to deliver notifications that immediately follow a
+        # GATT write, whereas idle notifications are often silently dropped.
+        sys.stderr.write("[client] CCCD set (NOTIFY), waiting for button (POLL mode)...\n")
+        deadline = loop.time() + BTN_TIMEOUT
+        msg = None
+        while msg is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+
+            await asyncio.sleep(0.5)
+
+            # Send POLL request
+            try:
+                await client.write_gatt_char(NUS_RX_UUID, b"POLL\n", response=True)
+            except Exception as e:
+                sys.stderr.write(f"[client] Poll write error: {e}\n")
+                continue
+
+            # Give M5Stick ~150 ms to process and send the notify response
+            await asyncio.sleep(0.15)
+
+            # Drain the notification queue; accept first valid ALLOW/DENY
+            while True:
+                try:
+                    line = queue.get_nowait()
+                    val = line.strip().upper()
+                    if val in ("ALLOW", "DENY"):
+                        msg = val
+                        sys.stderr.write(f"[client] Got via poll-notify: {msg}\n")
+                        break
+                except asyncio.QueueEmpty:
+                    break
+
         if msg not in ("ALLOW", "DENY"):
             raise RuntimeError(f"Unexpected response: {msg!r}")
 
@@ -223,7 +251,6 @@ def output_decision(decision: str) -> None:
 async def communicate_notify_ble(address: str, message: str) -> None:
     """通知を M5Stick に送信する（返答待ちなし）。"""
     sys.stderr.write(f"[client] Connecting to {address} (notify)...\n")
-    queue: asyncio.Queue = asyncio.Queue()
 
     async with BleakClient(address, timeout=CONNECT_TIMEOUT) as client:
         sys.stderr.write("[client] Connected.\n")
@@ -231,11 +258,10 @@ async def communicate_notify_ble(address: str, message: str) -> None:
             await client.request_mtu(512)
         except AttributeError:
             pass  # Windows WinRT backend handles MTU automatically
-        await _handshake_ble(client, queue)
 
         payload = f"NOTIFY:{message}\n".encode("utf-8")
         sys.stderr.write("[client] Writing to RX characteristic...\n")
-        await client.write_gatt_char(NUS_RX_UUID, payload, response=False)
+        await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
         sys.stderr.write(f"[client] Sent notification: {message!r}\n")
 
         await asyncio.sleep(NOTIFY_SEND_WAIT)
