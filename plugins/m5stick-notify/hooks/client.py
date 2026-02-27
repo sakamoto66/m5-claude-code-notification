@@ -22,11 +22,40 @@ PermissionRequest / Stop / Start / PreToolUse の全フックを1ファイルで
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 import traceback
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
+
+
+# ---------------------------------------------------------------------------
+# WSL 対応: WSL 環境では Windows Python で自身を再実行する
+# ---------------------------------------------------------------------------
+
+def _is_wsl() -> bool:
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
+
+def _relaunch_on_windows() -> None:
+    """WSL から Windows Python で自身を再実行し、終了コードを引き継ぐ。"""
+    try:
+        win_path = subprocess.check_output(
+            ["wslpath", "-w", str(Path(__file__))], text=True
+        ).strip()
+    except Exception as e:
+        sys.stderr.write(f"[client] wslpath failed: {e}\n")
+        sys.exit(1)
+    proc = subprocess.run(
+        ["cmd.exe", "/c", "python.exe", win_path] + sys.argv[1:],
+        stdin=sys.stdin,
+    )
+    sys.exit(proc.returncode)
 
 TARGET_NAME       = "M5-Claude-Notify"
 CONNECT_TIMEOUT  = 5.0   # seconds
@@ -370,6 +399,8 @@ async def _async_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    if _is_wsl():
+        _relaunch_on_windows()
     args = parse_args()
     asyncio.run(_async_main(args))
 
